@@ -59,10 +59,13 @@ processed_df = processed_df.filter(
 daily_counts = processed_df.groupBy("trip_date", "PULocationID") \
     .agg(F.count("*").alias("trip_count"))
 
+# Window để so sánh trip_count với ngày trước đó cho mỗi PULocationID
+window_spec = Window.partitionBy("PULocationID").orderBy("trip_date")
+
 batch_count = [0]
 
 def foreach_batch(batch_df, epoch_id):
-    """Xử lý từng batch: hiển thị top 5 location theo trip count"""
+    """Xử lý từng batch: hiển thị top 5 location theo growth_rate"""
     batch_count[0] += 1
     
     if batch_df.rdd.isEmpty():
@@ -76,14 +79,25 @@ def foreach_batch(batch_df, epoch_id):
     print(f"{'='*80}")
     sys.stdout.flush()
 
-    # Xếp hạng top 5 mỗi ngày theo trip count
-    rank_window = Window.partitionBy("trip_date").orderBy(F.desc("trip_count"))
-    top5_df = batch_df.withColumn("rank", F.row_number().over(rank_window)) \
+    growth_df = batch_df.withColumn(
+        "prev_count",
+        F.lag("trip_count").over(window_spec)
+    ).withColumn(
+        "growth_rate",
+        F.when(F.col("prev_count").isNull(), 0.0)
+         .when(F.col("prev_count") == 0, 0.0)
+         .otherwise((F.col("trip_count") - F.col("prev_count")) / F.col("prev_count") * 100)
+    )
+
+    # Xếp hạng top 5 mỗi ngày theo growth_rate
+    rank_window = Window.partitionBy("trip_date").orderBy(F.desc("growth_rate"))
+    top5_df = growth_df.withColumn("rank", F.row_number().over(rank_window)) \
         .filter(F.col("rank") <= 5) \
         .select(
             F.col("trip_date"),
             F.col("PULocationID"),
-            F.col("trip_count")
+            F.col("trip_count"),
+            F.round(F.col("growth_rate"), 2).alias("growth_rate")
         )
 
     if top5_df.rdd.isEmpty():
@@ -92,7 +106,7 @@ def foreach_batch(batch_df, epoch_id):
         return
 
     # Sắp xếp và hiển thị
-    rows = top5_df.orderBy("trip_date", F.desc("trip_count")).collect()
+    rows = top5_df.orderBy("trip_date", F.desc("growth_rate")).collect()
 
     current_date = None
     rank = 1
@@ -102,12 +116,12 @@ def foreach_batch(batch_df, epoch_id):
             if current_date is not None:
                 print()
             print(f"\n Ngày: {row.trip_date}")
-            print(f"{'Rank':<6} {'PULocationID':<15} {'trip_count':<15}")
-            print("-" * 40)
+            print(f"{'Rank':<6} {'PULocationID':<15} {'trip_count':<15} {'growth_rate (%)':<20}")
+            print("-" * 60)
             current_date = row.trip_date
             rank = 1
 
-        print(f"{rank:<6} {row.PULocationID:<15} {row.trip_count:<15}")
+        print(f"{rank:<6} {row.PULocationID:<15} {row.trip_count:<15} {row.growth_rate:<20.2f}")
         rank += 1
 
     print()
@@ -115,7 +129,7 @@ def foreach_batch(batch_df, epoch_id):
 
 
 query = daily_counts.writeStream \
-    .outputMode("update") \
+    .outputMode("complete") \
     .foreachBatch(foreach_batch) \
     .trigger(processingTime="3 seconds") \
     .option("checkpointLocation", checkpoint_path) \
